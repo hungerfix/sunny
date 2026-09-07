@@ -1,0 +1,54 @@
+name: Android CI Build
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Triggers
+# ──────────────────────────────────────────────────────────────────────────────
+on:
+  push:
+    branches:
+      - main
+      - master
+      - dev
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:       # Allow manual trigger from the GitHub Actions UI
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Debug APK
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── 2. Java ──────────────────────────────────────────────────────────────
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
+
+      # ── 3. Build ─────────────────────────────────────────────────────────────
+      - name: Make Gradle wrapper executable
+        run: chmod +x gradlew
+
+      - name: Build debug APK
+        run: ./gradlew assembleDebug --stacktrace
+
+      # ── 4. Upload artifact ───────────────────────────────────────────────────
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: xCam-debug-${{ github.sha }}
+          path: app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 14
