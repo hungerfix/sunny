@@ -106,7 +106,14 @@ class MediaEngine(private val logAction: (String) -> Unit) {
                 val exoPlayer = ExoPlayer.Builder(context.applicationContext, renderersFactory).build()
                 player = exoPlayer
 
-                val mediaItem = MediaItem.fromUri(uri)
+                val mediaItem = if (path.lowercase().contains(".m3u8")) {
+                    MediaItem.Builder()
+                        .setUri(uri)
+                        .setMimeType(androidx.media3.common.MimeTypes.APPLICATION_M3U8)
+                        .build()
+                } else {
+                    MediaItem.fromUri(uri)
+                }
 
                 val effects = mutableListOf<Effect>()
                 if (isMirrored || rotationAngle != 0) {
@@ -125,6 +132,7 @@ class MediaEngine(private val logAction: (String) -> Unit) {
                 exoPlayer.setMediaItem(mediaItem)
                 exoPlayer.setVideoSurface(surface)
                 exoPlayer.repeatMode = Player.REPEAT_MODE_ONE
+                exoPlayer.playWhenReady = true
 
                 exoPlayer.addListener(object : Player.Listener {
                     override fun onIsPlayingChanged(isPlaying: Boolean) {
@@ -141,7 +149,6 @@ class MediaEngine(private val logAction: (String) -> Unit) {
 
                     override fun onPlaybackStateChanged(playbackState: Int) {
                         if (playbackState == Player.STATE_READY) {
-                            if (!isBusy) return
                             isBusy = false
                             
                             if (videoWidth == 0) {
@@ -150,18 +157,17 @@ class MediaEngine(private val logAction: (String) -> Unit) {
                             }
 
                             try {
-                                exoPlayer.play()
                                 log(tag, "Player ACTIVE (${videoWidth}x${videoHeight})")
                                 onPrepared?.invoke(exoPlayer)
                             } catch (e: Throwable) {
-                                log(tag, "Start failed: ${e.message}")
+                                log(tag, "Start callback failed: ${e.message}")
                             }
                         }
                     }
 
                     override fun onPlayerError(error: PlaybackException) {
                         isBusy = false
-                        log(tag, "Player Error: ${error.errorCodeName} | ${error.message}")
+                        log(tag, "Player Error: ${error.errorCodeName} | ${error.message} | Cause: ${error.cause?.message}")
                         player?.release()
                         player = null
                         isPlayingInternal = false

@@ -26,6 +26,9 @@ class XCamEngine(
     private var lastModernSurface: Surface? = null
     private var lastInjectedGen = -1
     private var lastInjectedSurfaceId = -1L
+    private var lastInjectedPath: String? = null
+    private var lastInjectedMirrored: Boolean = false
+    private var lastInjectedRotation: Int = 0
 
     private fun log(tag: String, msg: String) = logAction("[$tag] $msg")
     private fun logPipe(msg: String) = log("PIPELINE", msg)
@@ -40,6 +43,7 @@ class XCamEngine(
         lastST = null
         lastModernSurface = null
         lastInjectedSurfaceId = -1L
+        lastInjectedPath = null
     }
 
     fun handleCamera1Preview(st: SurfaceTexture) {
@@ -49,13 +53,21 @@ class XCamEngine(
             return
         }
 
-        if ((st == lastST) && mediaEngine.isPlaying && lastInjectedGen == surfaceManager.sessionGeneration) return
-        lastST = st
-        lastInjectedGen = surfaceManager.sessionGeneration
-
         val path = settingsProvider().mediaPath ?: return
         val context = contextProvider() ?: return
         val settings = settingsProvider()
+
+        if (st == lastST && 
+            lastInjectedGen == surfaceManager.sessionGeneration &&
+            path == lastInjectedPath &&
+            settings.isMirrored == lastInjectedMirrored &&
+            settings.rotationAngle == lastInjectedRotation) return
+
+        lastST = st
+        lastInjectedGen = surfaceManager.sessionGeneration
+        lastInjectedPath = path
+        lastInjectedMirrored = settings.isMirrored
+        lastInjectedRotation = settings.rotationAngle
 
         logPipe("Legacy Hook: Injecting to SurfaceTexture")
         mediaEngine.play(context, path, surface, "Legacy", settings.isMirrored, settings.rotationAngle)
@@ -63,7 +75,15 @@ class XCamEngine(
 
     fun handleModernPreview(surface: Surface) {
         val currentGen = surfaceManager.sessionGeneration
-        if (surface == lastModernSurface && mediaEngine.isPlaying && lastInjectedGen == currentGen) return
+        val path = settingsProvider().mediaPath ?: ""
+        val settings = settingsProvider()
+
+        if (surface == lastModernSurface && 
+            lastInjectedGen == currentGen &&
+            path == lastInjectedPath &&
+            settings.isMirrored == lastInjectedMirrored &&
+            settings.rotationAngle == lastInjectedRotation) return
+
         lastModernSurface = surface
         uiHandler.post { processInjection(surface) }
     }
@@ -90,13 +110,20 @@ class XCamEngine(
             val currentGen = surfaceManager.sessionGeneration
             val settings = settingsProvider()
 
-            if (id == lastInjectedSurfaceId && mediaEngine.isPlaying && currentGen == lastInjectedGen) return
+            if (id == lastInjectedSurfaceId && 
+                currentGen == lastInjectedGen && 
+                path == lastInjectedPath &&
+                settings.isMirrored == lastInjectedMirrored &&
+                settings.rotationAngle == lastInjectedRotation) return
 
-            logPipe("Injection: ID=$id Gen=$currentGen")
+            logPipe("Injection: ID=$id Gen=$currentGen Path=$path")
             mediaEngine.stop()
             
             lastInjectedGen = currentGen
             lastInjectedSurfaceId = id
+            lastInjectedPath = path
+            lastInjectedMirrored = settings.isMirrored
+            lastInjectedRotation = settings.rotationAngle
             mediaEngine.play(context, path, surface, "Engine", settings.isMirrored, settings.rotationAngle)
         }
     }
