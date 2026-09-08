@@ -117,7 +117,6 @@ class XCamEngine(
                 settings.rotationAngle == lastInjectedRotation) return
 
             logPipe("Injection: ID=$id Gen=$currentGen Path=$path")
-            mediaEngine.stop()
             
             lastInjectedGen = currentGen
             lastInjectedSurfaceId = id

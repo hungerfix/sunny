@@ -5,25 +5,48 @@ import android.os.Handler
 import android.os.Looper
 import android.view.Surface
 import androidx.core.net.toUri
+import androidx.media3.common.C
 import androidx.media3.common.Effect
 import androidx.media3.common.MediaItem
+import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.TrackSelectionOverride
+import androidx.media3.common.TrackSelectionParameters
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.effect.ScaleAndRotateTransformation
+import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.hls.HlsMediaSource
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.source.MediaSource
+import okhttp3.OkHttpClient
+import java.util.concurrent.TimeUnit
 
 /**
  * Handles Media3/ExoPlayer lifecycle and state management for video injection.
+ *
+ * For M3U8/HLS streams, an explicit [HlsMediaSource.Factory] backed by
+ * [OkHttpDataSource] is used so that ExoPlayer can resolve the HLS playlist
+ * and download TS segments reliably — even when running inside a hooked app's
+ * process via Xposed (where classloader auto-discovery may fail).
  */
 @UnstableApi
 class MediaEngine(private val logAction: (String) -> Unit) {
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var player: ExoPlayer? = null
-    
-    @Volatile
-    private var isBusy = false
+
+    /** Shared OkHttpClient – reused across player rebuilds. */
+    private val okHttpClient: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(15, TimeUnit.SECONDS)
+            .followRedirects(true)
+            .followSslRedirects(true)
+            .build()
+    }
 
     @Volatile
     private var isPlayingInternal = false
@@ -53,26 +76,30 @@ class MediaEngine(private val logAction: (String) -> Unit) {
         logAction("[$tag] $msg")
     }
 
-    fun stop() {
-        mainHandler.post {
-            isBusy = true
-            try {
-                player?.apply {
-                    stop()
-                    clearVideoSurface()
-                    release()
-                }
-            } catch (e: Throwable) {
-                log("MEDIA-ENGINE", "Stop failed: ${e.message}")
-            } finally {
-                player = null
-                isPlayingInternal = false
-                currentPositionInternal = 0L
-                videoWidth = 0
-                videoHeight = 0
-                isBusy = false
+    // ── Internal helper: release old player (must be called on main thread) ──
+
+    private fun releasePlayerInternal() {
+        try {
+            player?.apply {
+                stop()
+                clearVideoSurface()
+                release()
             }
+        } catch (e: Throwable) {
+            log("MEDIA-ENGINE", "Release failed: ${e.message}")
+        } finally {
+            player = null
+            isPlayingInternal = false
+            currentPositionInternal = 0L
+            videoWidth = 0
+            videoHeight = 0
         }
+    }
+
+    // ── Public API ───────────────────────────────────────────────────────────
+
+    fun stop() {
+        mainHandler.post { releasePlayerInternal() }
     }
 
     fun play(
@@ -85,36 +112,54 @@ class MediaEngine(private val logAction: (String) -> Unit) {
         onPrepared: ((ExoPlayer?) -> Unit)? = null
     ) {
         mainHandler.post {
-            if (isBusy) return@post
-            
-            isBusy = true
-            try {
-                player?.apply {
-                    stop()
-                    clearVideoSurface()
-                    release()
-                }
-            } catch (_: Throwable) {}
+            // Atomically release old player, then build + start new one.
+            releasePlayerInternal()
 
             try {
                 val uri = path.toUri()
-                log(tag, "Loading media: $path (Video only pipeline)")
+                val isHls = path.lowercase().let {
+                    it.contains(".m3u8") || it.contains("m3u8")
+                }
+                log(tag, "Loading media: $path (HLS=$isHls)")
 
-                val renderersFactory = androidx.media3.exoplayer.DefaultRenderersFactory(context.applicationContext)
-                    .setExtensionRendererMode(androidx.media3.exoplayer.DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON)
+                // ── Build MediaSource factory ────────────────────────────────
+                val appContext = context.applicationContext
+                val okDataSourceFactory = OkHttpDataSource.Factory(okHttpClient)
 
-                val exoPlayer = ExoPlayer.Builder(context.applicationContext, renderersFactory).build()
+                val mediaSourceFactory: MediaSource.Factory = if (isHls) {
+                    // Explicit HLS factory — bypasses classloader auto-discovery
+                    HlsMediaSource.Factory(okDataSourceFactory)
+                } else {
+                    DefaultMediaSourceFactory(appContext)
+                }
+
+                // ── Build renderers (video only — no audio renderer needed) ──
+                val renderersFactory = DefaultRenderersFactory(appContext)
+                    .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON)
+
+                // ── Build ExoPlayer ──────────────────────────────────────────
+                val exoPlayer = ExoPlayer.Builder(appContext, renderersFactory)
+                    .setMediaSourceFactory(mediaSourceFactory)
+                    .build()
                 player = exoPlayer
 
-                val mediaItem = if (path.lowercase().contains(".m3u8")) {
+                // Disable audio track selection — we only need video frames.
+                exoPlayer.trackSelectionParameters = exoPlayer.trackSelectionParameters
+                    .buildUpon()
+                    .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, true)
+                    .build()
+
+                // ── Build MediaItem ──────────────────────────────────────────
+                val mediaItem = if (isHls) {
                     MediaItem.Builder()
                         .setUri(uri)
-                        .setMimeType(androidx.media3.common.MimeTypes.APPLICATION_M3U8)
+                        .setMimeType(MimeTypes.APPLICATION_M3U8)
                         .build()
                 } else {
                     MediaItem.fromUri(uri)
                 }
 
+                // ── Video effects (mirror / rotate) ──────────────────────────
                 val effects = mutableListOf<Effect>()
                 if (isMirrored || rotationAngle != 0) {
                     val scaleX = if (isMirrored) -1f else 1f
@@ -128,16 +173,17 @@ class MediaEngine(private val logAction: (String) -> Unit) {
                 if (effects.isNotEmpty()) {
                     exoPlayer.setVideoEffects(effects)
                 }
-                
+
+                // ── Wire up and prepare ──────────────────────────────────────
                 exoPlayer.setMediaItem(mediaItem)
                 exoPlayer.setVideoSurface(surface)
                 exoPlayer.repeatMode = Player.REPEAT_MODE_ONE
                 exoPlayer.playWhenReady = true
 
                 exoPlayer.addListener(object : Player.Listener {
-                    override fun onIsPlayingChanged(isPlaying: Boolean) {
-                        isPlayingInternal = isPlaying
-                        if (isPlaying) startPositionPolling() else stopPositionPolling()
+                    override fun onIsPlayingChanged(playing: Boolean) {
+                        isPlayingInternal = playing
+                        if (playing) startPositionPolling() else stopPositionPolling()
                     }
 
                     override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
@@ -148,43 +194,41 @@ class MediaEngine(private val logAction: (String) -> Unit) {
                     }
 
                     override fun onPlaybackStateChanged(playbackState: Int) {
-                        if (playbackState == Player.STATE_READY) {
-                            isBusy = false
-                            
-                            if (videoWidth == 0) {
-                                videoWidth = exoPlayer.videoSize.width
-                                videoHeight = exoPlayer.videoSize.height
-                            }
-
-                            try {
+                        when (playbackState) {
+                            Player.STATE_READY -> {
+                                if (videoWidth == 0) {
+                                    videoWidth = exoPlayer.videoSize.width
+                                    videoHeight = exoPlayer.videoSize.height
+                                }
                                 log(tag, "Player ACTIVE (${videoWidth}x${videoHeight})")
-                                onPrepared?.invoke(exoPlayer)
-                            } catch (e: Throwable) {
-                                log(tag, "Start callback failed: ${e.message}")
+                                try { onPrepared?.invoke(exoPlayer) } catch (_: Throwable) {}
                             }
+                            Player.STATE_BUFFERING -> {
+                                log(tag, "Buffering…")
+                            }
+                            Player.STATE_ENDED -> {
+                                log(tag, "Playback ended (should loop)")
+                            }
+                            Player.STATE_IDLE -> { /* no-op */ }
                         }
                     }
 
                     override fun onPlayerError(error: PlaybackException) {
-                        isBusy = false
                         log(tag, "Player Error: ${error.errorCodeName} | ${error.message} | Cause: ${error.cause?.message}")
-                        player?.release()
-                        player = null
-                        isPlayingInternal = false
+                        releasePlayerInternal()
                     }
                 })
 
                 exoPlayer.prepare()
 
             } catch (e: Throwable) {
-                isBusy = false
                 log(tag, "Prepare failed: ${e.message}")
-                try { player?.release() } catch (_: Throwable) {}
-                player = null
-                isPlayingInternal = false
+                releasePlayerInternal()
             }
         }
     }
+
+    // ── Position polling ─────────────────────────────────────────────────────
 
     private val positionPoller = object : Runnable {
         override fun run() {
